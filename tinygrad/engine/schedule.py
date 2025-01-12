@@ -229,7 +229,7 @@ add_assign_adjacents = PatternMatcher([(UPat.load(UPat.var("b"), UPat(), name="x
                                if b in ctx.assigns else None)])
 
 # late folding for multi output kernels
-multioutput = PatternMatcher([(UPat.load(UPat.var("b"), UPat()), lambda ctx,b: ctx.sinked.get(b)),])
+multioutput = PatternMatcher([(UPat.load(UPat.var("glbl"), UPat()), lambda ctx,glbl: list(ctx.sinked.values())[glbl.arg]),])
 
 def add_load(ctx:list[UOp], root:UOp):
   if root not in ctx: ctx.append(root)
@@ -535,7 +535,7 @@ remove_movement_ops = PatternMatcher([
 
 @track_rewrites(named=True)
 def create_schedule_with_vars(outs:list[UOp], skip_check:bool=not __debug__) -> tuple[list[ScheduleItem], dict[Variable, int], dict[UOp, UOp]]:
-  # TODO: this is a hack.
+  # TODO: this is a hack. (for process replay)
   seed = int(repr(UOp.buffer_num)[6:-1])
   sink = UOp.sink(*outs)
   if not skip_check: type_verify(list(sink.toposort), tensor_uop_spec)
@@ -582,7 +582,7 @@ def create_schedule_with_vars(outs:list[UOp], skip_check:bool=not __debug__) -> 
   if len(schedule) != (groups:=len(prescheduled)): raise RuntimeError(f"cycle detected in graph, grouped {groups} but only scheduled {len(schedule)}")
   if DEBUG >= 1 and len(schedule) >= 10: print(f"scheduled {len(schedule)} kernels")
   # capture process replay
-  if CAPTURE_PROCESS_REPLAY:
+  if CAPTURE_PROCESS_REPLAY and getenv("RUN_PROCESS_REPLAY"): # NOT YET FOR CI!
     # in comes tensors, out goes asts
     in_sink = UOp(Ops.SINK, src=tuple(outs))
     out_sink = UOp(Ops.SINK, src=tuple([x.ast for x in schedule]))
