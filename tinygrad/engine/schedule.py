@@ -218,6 +218,8 @@ to_si = PatternMatcher([
   # don't need contiguous or assign anymore
   (UPat(Ops.CONTIGUOUS, src=(UPat.var("x"),)), lambda x: x),
   (UPat(Ops.ASSIGN, src=(UPat(), UPat.var("x"),)), lambda x: x),
+  # remove const shape
+  (UPat(Ops.CONST, name="root", src=(UPat(),)), lambda root:root.replace(src=()))
 ])
 
 add_metadata = PatternMatcher([(UPat(tuple(Ops), name="x"), lambda ctx,x: None if (m:=ctx.ops_metadata.get(x)) is None else ctx.metadata.add(m)),])
@@ -227,11 +229,32 @@ add_assign_adjacents = PatternMatcher([(UPat.load(UPat.var("b"), UPat(), name="x
 # late folding for multi output kernels
 multioutput = PatternMatcher([(UPat.load(UPat.var("b"), UPat()), lambda ctx,b: ctx.sinked.get(b)),])
 
-def schedule_uop(pre:UOp, ctx:ScheduleContext) -> ScheduleItem:
-  # create the ast context
-  si_ctx = ScheduleItemContext(ctx.ops_metadata, ctx.assigns, ctx.var_vals, {x.buf_uop:x.src[2] for x in pre.src})
+def add_load(ctx:list[UOp], root:UOp):
+  if root not in ctx: ctx.append(root)
+  glbl = UOp(Ops.DEFINE_GLOBAL, root.dtype.ptr(size=root.size), (), ctx.index(root))
+  return UOp(Ops.LOAD, root.dtype, (glbl, unwrap(root.st).to_uop()))
+
+def add_store(ctx:list[UOp], root:UOp):
+  if all(x.op is Ops.STORE for x in root.src): return None
+  new_src: list[UOp] = []
+  for i,x in enumerate(root.src):
+    glbl = UOp(Ops.DEFINE_GLOBAL, x.dtype.ptr(size=x.size), (), i)
+    new_src.append(UOp.store(glbl, ShapeTracker.from_shape(x.shape).to_uop(), x))
+  return root.replace(src=tuple(new_src))
+
+remove_buffers = PatternMatcher([
+  (UPat(Ops.BUFFER, name="root"), add_load),
+  (UPat(Ops.SINK, name="root"), add_store),
+])
+
+def schedule_uop(sink:UOp, store_targets:tuple[UOp, ...], ctx:ScheduleContext) -> ScheduleItem:
+  assert all(x.op is Ops.BUFFER for x in store_targets), f"targets must be BUFFER"
+  # start by replacing BUFFER in the graph with LOAD/STORE
+  sink = graph_rewrite(sink, remove_buffers, bufs:=list(store_targets))
+  # do ast rewrite
+  si_ctx = ScheduleItemContext(ctx.ops_metadata, ctx.assigns, ctx.var_vals, {b:x.src[2] for b,x in zip(bufs, sink.src)}, bufs=bufs)
   create_ctx = add_metadata if len(si_ctx.assigns) == 0 else add_metadata+add_assign_adjacents
-  sink = graph_rewrite(pre, create_ctx if len(si_ctx.sinked) == 1 else multioutput+create_ctx, si_ctx)
+  sink = graph_rewrite(sink, create_ctx if len(si_ctx.sinked) == 1 else multioutput+create_ctx, si_ctx)
   # do movement ops
   sink = graph_rewrite(graph_rewrite(sink, view_left), view_right)
   # convert to AST
@@ -246,17 +269,8 @@ def schedule_uop(pre:UOp, ctx:ScheduleContext) -> ScheduleItem:
         and ShapeTracker.from_shape(s.shape).shrink(m) == s.shrink(m)) for x in ops):
       raise RuntimeError("self operand of augmented assign must be contiguous.\nhelp: consider using .contiguous():\n"
                          +colored("   - a += a.T\n", "red")+colored("   + a += a.T.contiguous()", "green"))
-  # capture process replay
-  if CAPTURE_PROCESS_REPLAY:
-    with Context(PICKLE_BUFFERS=0): PROCESS_REPLAY_CAPTURE[str(pre.key)] = pickle.dumps((pre, si_ctx.assigns, ContextVar._cache, sink))
   return ScheduleItem(sink, tuple(u.buffer for u in si_ctx.bufs if u.size != 0), tuple(si_ctx.metadata),
                       tuple(ubuf for ubuf,ops in si_ctx.assign_adj.items() if any(x.op is Ops.PRELOAD for x in ops)))
-
-PROCESS_REPLAY_CAPTURE: dict[str, bytes] = {}
-if CAPTURE_PROCESS_REPLAY:
-  @atexit.register
-  def save_process_replay() -> None:
-    for k,v in PROCESS_REPLAY_CAPTURE.items(): diskcache_put("schedule_process_replay", k, v, prepickled=True)
 
 # **** Schedule grouping
 
@@ -519,9 +533,8 @@ def create_schedule_with_vars(outs:list[UOp], skip_check:bool=not __debug__) -> 
   # preschedule realize groups
   prescheduled: list[ScheduleItem] = []
   for store_uops in store_groups:
-    stores = [ctx.realizes[u] for u in store_uops if ctx.realizes[u].op is Ops.STORE]
-    assert len(stores) == len(store_uops)
-    prescheduled.append(schedule_uop(UOp.sink(*stores), ctx))
+    to_store = [ctx.realizes[u] for u in store_uops]
+    prescheduled.append(schedule_uop(UOp.sink(*to_store), store_uops, ctx))
     # can only schedule once
     for buf_uop in store_uops:
       for luop in ctx.tensor_uops[buf_uop]: ctx.becomes_map[luop] = buf_uop.view(unwrap(luop.st))
