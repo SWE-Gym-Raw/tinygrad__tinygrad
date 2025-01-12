@@ -227,7 +227,7 @@ add_metadata = PatternMatcher([
   (UPat(Ops.LOAD, src=(UPat(Ops.LOAD, name="load"), UPat.var("vm"))), lambda load,vm: load.view(vm.st)),
 ])
 add_assign_adjacents = PatternMatcher([(UPat.load(UPat.var("b"), UPat(), name="x"), lambda ctx,b,x: ctx.assign_adj.setdefault(b, []).append(x)
-                               if b in ctx.assigns else None)])
+                               if ctx.bufs[b.arg] in ctx.assigns else None)])
 
 def multi_output_fuse(ctx:UOp, glbl:UOp, root:UOp):
   if glbl.arg >= len(ctx.sinked): return
