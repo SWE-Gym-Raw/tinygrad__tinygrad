@@ -274,6 +274,12 @@ def schedule_uop(sink:UOp, store_targets:tuple[UOp, ...], ctx:ScheduleContext) -
   return ScheduleItem(sink, tuple(u.buffer for u in si_ctx.bufs if u.size != 0), tuple(si_ctx.metadata),
                       tuple(ubuf for ubuf,ops in si_ctx.assign_adj.items() if any(x.op is Ops.PRELOAD for x in ops)))
 
+PROCESS_REPLAY_CAPTURE: dict[str, bytes] = {}
+if CAPTURE_PROCESS_REPLAY:
+  @atexit.register
+  def save_process_replay() -> None:
+    for k,v in PROCESS_REPLAY_CAPTURE.items(): diskcache_put("schedule_process_replay", k, v, prepickled=True)
+
 # **** Schedule grouping
 
 def is_scheduled(u:UOp) -> bool: return u.op is Ops.VIEW and len(u.src) == 2 and u.src[0].op is Ops.BUFFER
@@ -534,6 +540,8 @@ remove_movement_ops = PatternMatcher([
 
 @track_rewrites(named=True)
 def create_schedule_with_vars(outs:list[UOp], skip_check:bool=not __debug__) -> tuple[list[ScheduleItem], dict[Variable, int], dict[UOp, UOp]]:
+  # TODO: this is a hack.
+  seed = int(repr(UOp.buffer_num)[6:-1])
   sink = UOp.sink(*outs)
   if not skip_check: type_verify(list(sink.toposort), tensor_uop_spec)
   # start by simplifying the graph on tensors
@@ -578,4 +586,10 @@ def create_schedule_with_vars(outs:list[UOp], skip_check:bool=not __debug__) -> 
   # confirm everything was scheduled correctly
   if len(schedule) != (groups:=len(prescheduled)): raise RuntimeError(f"cycle detected in graph, grouped {groups} but only scheduled {len(schedule)}")
   if DEBUG >= 1 and len(schedule) >= 10: print(f"scheduled {len(schedule)} kernels")
+  # capture process replay
+  if CAPTURE_PROCESS_REPLAY:
+    # in comes tensors, out goes asts
+    in_sink = UOp(Ops.SINK, src=tuple(outs))
+    out_sink = UOp(Ops.SINK, src=tuple([x.ast for x in schedule]))
+    with Context(PICKLE_BUFFERS=0): PROCESS_REPLAY_CAPTURE[str(in_sink.key)] = pickle.dumps((in_sink, seed, ContextVar._cache, out_sink))
   return schedule, ctx.var_vals, ctx.becomes_map
