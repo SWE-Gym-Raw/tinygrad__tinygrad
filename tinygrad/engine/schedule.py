@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from tinygrad.ops import GroupOp, UOp, Ops, PatternMatcher, UPat, Variable, can_pad, graph_rewrite, resolve, track_rewrites, view_left, merge_views
 from tinygrad.ops import identity_element, buffers, symbolic_simple, type_verify, graph_rewrite_map
 from tinygrad.helpers import Context, Metadata, all_int, all_same, colored, diskcache_put, merge_dicts, prod, dedup, getenv, unwrap
-from tinygrad.helpers import FUSE_CONV_BW, FUSE_ARANGE, DEBUG, ContextVar
+from tinygrad.helpers import FUSE_CONV_BW, FUSE_ARANGE, DEBUG, CAPTURE_PROCESS_REPLAY, ContextVar
 from tinygrad.dtype import DType, ImageDType, dtypes
 from tinygrad.shape.shapetracker import ShapeTracker
 from tinygrad.shape.view import View, strides_for_shape
@@ -99,9 +99,6 @@ class ScheduleContext:
   children: defaultdict[UOp, dict[UOp, None]] = field(default_factory=lambda: defaultdict(dict))
   becomes_map: dict[UOp, UOp] = field(default_factory=dict)
 
-# TODO: delete this once BIND has a VIEW source
-def is_constant(u:UOp): return u.op is Ops.CONST or (u.op is Ops.VIEW and len(u.src) == 2 and u.src[1].op is Ops.BIND)
-
 # wrap tensor uops around a VIEW(BUFFER, <uop>)
 # this BUFFER preserves a link back to the uop on the tensor after the scheduler rewrites it.
 def add_buffers(buf:UOp, ctx:ScheduleContext, cache:dict[UOp, UOp]) -> UOp:
@@ -110,7 +107,7 @@ def add_buffers(buf:UOp, ctx:ScheduleContext, cache:dict[UOp, UOp]) -> UOp:
   # shapeless op is passthrough
   # realized is passthrough
   # constants are passthrough
-  if buf.st is None or buf.base.is_realized or buf.base.op is Ops.VIEW or is_constant(buf.base): return buf
+  if buf.st is None or buf.base.is_realized or buf.base.op in {Ops.CONST, Ops.BIND}: return buf
   # view is passthrough
   if buf is not buf.base:
     cache[buf] = ret = add_buffers(buf.base, ctx, cache).view(buf.st)
@@ -250,13 +247,13 @@ def schedule_uop(pre:UOp, ctx:ScheduleContext) -> ScheduleItem:
       raise RuntimeError("self operand of augmented assign must be contiguous.\nhelp: consider using .contiguous():\n"
                          +colored("   - a += a.T\n", "red")+colored("   + a += a.T.contiguous()", "green"))
   # capture process replay
-  if getenv("RUN_PROCESS_REPLAY"):
+  if CAPTURE_PROCESS_REPLAY:
     with Context(PICKLE_BUFFERS=0): PROCESS_REPLAY_CAPTURE[str(pre.key)] = pickle.dumps((pre, si_ctx.assigns, ContextVar._cache, sink))
   return ScheduleItem(sink, tuple(u.buffer for u in si_ctx.bufs if u.size != 0), tuple(si_ctx.metadata),
                       tuple(ubuf for ubuf,ops in si_ctx.assign_adj.items() if any(x.op is Ops.PRELOAD for x in ops)))
 
 PROCESS_REPLAY_CAPTURE: dict[str, bytes] = {}
-if getenv("RUN_PROCESS_REPLAY"):
+if CAPTURE_PROCESS_REPLAY:
   @atexit.register
   def save_process_replay() -> None:
     for k,v in PROCESS_REPLAY_CAPTURE.items(): diskcache_put("schedule_process_replay", k, v, prepickled=True)
@@ -411,8 +408,38 @@ ops_folding = symbolic_simple+PatternMatcher([
   # support for using a contiguous permuted view instead of the parent view if one exists
   (UPat(Ops.CONTIGUOUS, name="contig"), found_contiguous),
   (UPat(GroupOp.ALU, name="alu"), replace_contiguous),
-  # sink folding
-  (UPat(Ops.SINK, name="root"), lambda root: root.replace(src=a) if (a:=tuple(x.base for x in root.src)) != root.src else None),
+  # remove CONST/BIND/BUFFER/VIEW from SINK
+  (UPat(Ops.SINK, name="root"),
+    lambda root: UOp(Ops.SINK, root.dtype, new_src, root.arg)
+      if (new_src:=tuple(x.base for x in root.src if not x.is_realized and x.base.op not in {Ops.CONST, Ops.BIND})) != root.src else None),
+])
+
+# ** buffer merging
+
+def merge(ctx:ScheduleContext, v1:UOp, b1:UOp, v2:UOp, b2:UOp) -> UOp:
+  assert v1.st is not None and v2.st is not None and v1.st == v2.st, f"implicit movementop {v1.st} {v2.st}"
+  # if b2 is realized also realize b1
+  if b2 in ctx.realizes:
+    ctx.realizes[b1] = b1
+    del ctx.realizes[b2]
+  # ops referring to b2 now ref to b1
+  ctx.tensor_uops[b1] += ctx.tensor_uops[b2]
+  del ctx.tensor_uops[b2]
+  # merge
+  return v1
+
+def merge_realized(ctx:ScheduleContext, v1:UOp, b1:UOp, v2:UOp, b2:UOp):
+  # early become
+  for luop in ctx.tensor_uops.get(b1, [])+ctx.tensor_uops.get(b2, []): ctx.becomes_map[luop] = b1.view(unwrap(luop.st))
+  return v1
+
+merge_bufs = PatternMatcher([
+  # merge base
+  (UPat(Ops.VIEW, name="v2", src=(UPat(Ops.BUFFER, name="b2"), UPat(Ops.VIEW, name="v1", src=(UPat(Ops.BUFFER, name="b1"), UPat())))), merge),
+  (UPat(Ops.VIEW, name="v2", src=(UPat(Ops.BUFFER, name="b2"), UPat(Ops.VIEW, name="v1", src=(UPat(Ops.BUFFER, name="b1"),)))), merge_realized),
+  # collapse view
+  (UPat(Ops.VIEW, src=(UPat(Ops.BUFFER), UPat(Ops.VIEW, src=(UPat(Ops.BUFFER), UPat())).view(name="mv"))), lambda mv:mv),
+  (UPat(Ops.VIEW, src=(UPat(Ops.BUFFER), UPat(Ops.VIEW, src=(UPat(Ops.BUFFER),)).view(name="mv"))), lambda mv:mv),
 ])
 
 # ** this decides which ops get realized
@@ -442,9 +469,7 @@ def fold_img_cast(ctx:ScheduleContext, xb:UOp, view:UOp, b:UOp, to_cast:UOp, **k
 
 def is_buffer_view(x:UOp): return x.op is Ops.VIEW and len(x.src) == 1 and x.src[0].op is Ops.BUFFER
 def sink_outputs(ctx:ScheduleContext, sink:UOp) -> UOp|None:
-  new_src = tuple(x.base for x in sink.src if not is_buffer_view(x.base) and not is_constant(x.base))
-  for x in new_src: realize(ctx, x.buf_uop, x)
-  return None if new_src == sink.src else UOp(Ops.NOOP) if len(new_src) == 0 else UOp.sink(*new_src)
+  for x in sink.src: realize(ctx, x.buf_uop, x)
 
 do_realize = PatternMatcher([
   # always realize sinked ops
