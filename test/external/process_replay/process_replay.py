@@ -90,8 +90,10 @@ def diff(offset:int, name:str, fxn:Callable) -> Union[Tuple[int, int], bool]:
         if a is b: continue
         if a.op is not Ops.SINK: continue
         from tinygrad.codegen.kernel import Kernel
-        k = Kernel(a).to_program()
-        print(k.src)
+        ak = Kernel(a).to_program()
+        bk = Kernel(b).to_program()
+        changes = list(difflib.unified_diff(str(ak.src).splitlines(), str(bk.src).splitlines()))
+        logging.info("\n".join(colored(line, "red" if line.startswith("-") else "green" if line.startswith("+") else None) for line in changes))
       if ASSERT_DIFF: return additions, deletions
   conn.commit()
   cur.close()

@@ -226,9 +226,10 @@ if getenv("RUN_PROCESS_REPLAY"):
   @atexit.register
   def run_process_replay():
     # start by creating the reference branch (based on master)
-    if os.path.isdir(wdir:=temp("worktree_process_replay")): subprocess.check_call(["git", "worktree", "remove", wdir, "-f"])
-    subprocess.check_call(["git", "branch", "-f", "process_replay_ref", "master"])
-    subprocess.check_call(["git", "worktree", "add", wdir, "process_replay_ref"])
+    wdir=temp("worktree_process_replay")
+    #if os.path.isdir(wdir:=temp("worktree_process_replay")): subprocess.check_call(["git", "worktree", "remove", wdir, "-f"])
+    #subprocess.check_call(["git", "branch", "-f", "process_replay_ref", "master"])
+    #subprocess.check_call(["git", "worktree", "add", wdir, "process_replay_ref"])
     # run process replay on the reference branch
     os.environ["RUN_PROCESS_REPLAY"] = "0"
     ref_path = os.path.join(wdir, "process_replay.py")
