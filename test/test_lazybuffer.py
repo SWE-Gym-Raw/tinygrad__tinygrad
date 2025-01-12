@@ -68,7 +68,7 @@ class TestLazyBuffer(unittest.TestCase):
     assert lb.const_like(1).const_arg == 1.0
     assert type(lb.const_like(1).const_arg) is float
 
-  def test_forced_realized_alu(self):
+  def test_contiguous_on_contiguous_alu(self):
     a = Tensor.randn(2, 2).realize()
     b = Tensor.randn(2, 2).realize()
     add = (a+b).contiguous()
