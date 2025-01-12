@@ -246,11 +246,12 @@ def add_load(ctx:ScheduleItemContext, root:UOp):
   glbl = UOp(Ops.DEFINE_GLOBAL, root.dtype.ptr(size=root.size), (), ctx.bufs.index(root))
   return UOp(load_op, root.dtype, (glbl, unwrap(root.st).to_uop()))
 
-def add_store(ctx:list[UOp], root:UOp):
+def add_store(ctx:ScheduleItemContext, root:UOp):
   if all(x.op is Ops.STORE for x in root.src): return None
   new_src: list[UOp] = []
   for i,x in enumerate(root.src):
     glbl = UOp(Ops.DEFINE_GLOBAL, x.dtype.ptr(size=x.size), (), i)
+    ctx.sinked[ctx.bufs[i]] = x
     new_src.append(UOp.store(glbl, ShapeTracker.from_shape(x.shape).to_uop(), x))
   return root.replace(src=tuple(new_src))
 
@@ -264,7 +265,6 @@ def schedule_uop(sink:UOp, store_targets:tuple[UOp, ...], ctx:ScheduleContext) -
   si_ctx = ScheduleItemContext(ctx.ops_metadata, ctx.assigns, ctx.var_vals, {}, bufs=list(store_targets))
   # start by replacing BUFFER in the graph with LOAD/STORE
   sink = graph_rewrite(sink, remove_buffers, si_ctx)
-  si_ctx.sinked.update((b,x.src[2]) for b,x in zip(store_targets, sink.src))
   # do ast rewrite
   create_ctx = add_metadata if len(si_ctx.assigns) == 0 else add_metadata+add_assign_adjacents
   sink = graph_rewrite(sink, create_ctx, si_ctx)
