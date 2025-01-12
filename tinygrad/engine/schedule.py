@@ -460,30 +460,18 @@ do_realize = PatternMatcher([
   (UPat(Ops.BUFFER_VIEW, src=(UPat.any(UPatScheduled(), UPatScheduled().view()),)), realize),
 ])
 
-# **** rewrite VIEW into LOAD/STORE/VALID or fuse the underlying UOp
+# **** break the graph into kernels, collapse BUFFERs that are not needed anymore
 
-def unbind_variable(ctx:ScheduleContext, bind:UOp, var:UOp, val:UOp):
-  assert isinstance(val.src[1].const_arg, int), f"expected BIND value to be int {val}"
-  ctx.var_vals[ret:=var.replace(src=())] = val.src[1].const_arg
-  return ret.valid(unwrap(bind.st))
-
-def load_realized(ctx:ScheduleContext, b:UOp, st:UOp):
-  # NOTE: if we're assigning to the BUFFER too, PRELOAD tells toposort to place this load before the ASSIGN
-  return UOp(Ops.PRELOAD if b in ctx.assigns else Ops.LOAD, b.dtype.base, (b, unwrap(st.st).to_uop()))
-
-def store_or_fuse(ctx:ScheduleContext, b:UOp, x:UOp, st:UOp):
-  if (m:=ctx.tensor_uops[b][0].metadata) is not None: ctx.ops_metadata[x] = m
-  if b not in ctx.realizes: return x # collapse BUFFER
-  ctx.realizes[b] = UOp.store(b, ShapeTracker.from_shape(st.shape).to_uop(), x)
-  return UOp(Ops.LOAD, x.dtype, (b, unwrap(st.st).to_uop()))
+def store_or_fuse(ctx:ScheduleContext, x:UOp, buffer:UOp, st:UOp):
+  if (m:=ctx.tensor_uops[buffer][0].metadata) is not None: ctx.ops_metadata[x] = m
+  if buffer not in ctx.realizes: return x.view(unwrap(st.st)) # collapse BUFFER
+  # otherwise all children use a VIEW(BUFFER) instead of the underlying UOp
+  ctx.realizes[buffer] = x
+  return buffer.view(unwrap(st.st))
 
 break_sched = PatternMatcher([
-  # CONST is always fused and generated
-  (UPat(Ops.CONST, name="x", src=(UPat(Ops.VIEW, name="st"),)), lambda x,st: UOp.const(x.dtype.base, x.const_arg).valid(st.st)),
-  (UPat(Ops.BIND, name="bind", src=(UPat.var("var"), UPat.var("val"))), unbind_variable),
-  # VIEW of BUFFER either becomes a LOAD/STORE or we fuse it
-  (UPat(Ops.VIEW, name="st", src=(UPat(Ops.BUFFER, name="b"),)), load_realized),
-  (UPat(Ops.VIEW, name="st", src=(UPat(Ops.BUFFER, name="b"), UPat.var("x"))), store_or_fuse),
+  # bufferized uops either becomes a VIEW(BUFFER) or we VIEW the uop and delete the BUFFER
+  (UPat(Ops.VIEW, name="st", src=(UPat(Ops.BUFFER, name="buffer"), UPat.var("x"))), store_or_fuse),
 ])
 
 # **** Schedule context builder
