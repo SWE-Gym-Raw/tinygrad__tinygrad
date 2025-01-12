@@ -496,14 +496,9 @@ def unbind_variable(ctx:ScheduleContext, bind:UOp, var:UOp, val:UOp):
   ctx.var_vals[ret:=var.replace(src=())] = val.src[1].const_arg
   return ret.valid(unwrap(bind.st))
 
-def mv_const(x:UOp):
-  flat_const = UOp.const(x.dtype.base, x.const_arg)
-  #if all(v.mask is None for v in unwrap(st.st).views): return flat_const
-  return flat_const.valid(unwrap(x.st))
-
 break_sched = PatternMatcher([
-  # CONST becomes VALID (doesn't need to)
-  (UPat(Ops.CONST, name="x", src=(UPat(),)), mv_const),
+  # CONST is always fused and generated
+  (UPat(Ops.CONST, name="x", src=(UPat(Ops.VIEW, name="st"),)), lambda x,st: UOp.const(x.dtype.base, x.const_arg).valid(st.st)),
   (UPat(Ops.BIND, name="bind", src=(UPat.var("var"), UPat.var("val"))), unbind_variable),
   # bufferized uops either becomes a VIEW(BUFFER) or we VIEW the uop and delete the BUFFER
   (UPat(Ops.VIEW, name="st", src=(UPat(Ops.BUFFER, name="buffer"), UPat.var("x"))), store_or_fuse),

@@ -85,7 +85,13 @@ def diff(offset:int, name:str, fxn:Callable) -> Union[Tuple[int, int], bool]:
       changes = list(difflib.unified_diff(str(good).splitlines(), str(args[-1]).splitlines()))
       additions += len([x for x in changes if x.startswith("+")])
       deletions += len([x for x in changes if x.startswith("-")])
-      logging.info("\n".join(colored(line, "red" if line.startswith("-") else "green" if line.startswith("+") else None) for line in changes))
+      #logging.info("\n".join(colored(line, "red" if line.startswith("-") else "green" if line.startswith("+") else None) for line in changes))
+      for a, b in zip(args[-1].src, good.src):
+        if a is b: continue
+        if a.op is not Ops.SINK: continue
+        from tinygrad.codegen.kernel import Kernel
+        k = Kernel(a).to_program()
+        print(k.src)
       if ASSERT_DIFF: return additions, deletions
   conn.commit()
   cur.close()
