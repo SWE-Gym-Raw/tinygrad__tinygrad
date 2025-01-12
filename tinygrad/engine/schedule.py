@@ -218,11 +218,13 @@ to_si = PatternMatcher([
   # don't need contiguous or assign anymore
   (UPat(Ops.CONTIGUOUS, src=(UPat.var("x"),)), lambda x: x),
   (UPat(Ops.ASSIGN, src=(UPat(), UPat.var("x"),)), lambda x: x),
+])
+
+add_metadata = PatternMatcher([
+  (UPat(tuple(Ops), name="x"), lambda ctx,x: None if (m:=ctx.ops_metadata.get(x)) is None else ctx.metadata.add(m)),
   # remove const shape
   (UPat(Ops.CONST, name="root", src=(UPat(),)), lambda root:root.replace(src=()))
 ])
-
-add_metadata = PatternMatcher([(UPat(tuple(Ops), name="x"), lambda ctx,x: None if (m:=ctx.ops_metadata.get(x)) is None else ctx.metadata.add(m)),])
 add_assign_adjacents = PatternMatcher([(UPat.load(UPat.var("b"), UPat(), name="x"), lambda ctx,b,x: ctx.assign_adj.setdefault(b, []).append(x)
                                if b in ctx.assigns else None)])
 
@@ -483,7 +485,15 @@ def store_or_fuse(ctx:ScheduleContext, x:UOp, buffer:UOp, st:UOp):
   ctx.realizes[buffer] = x
   return buffer.view(unwrap(st.st))
 
+def unbind_variable(ctx:ScheduleContext, bind:UOp, var:UOp, val:UOp):
+  assert isinstance(val.src[1].const_arg, int), f"expected BIND value to be int {val}"
+  ctx.var_vals[ret:=var.replace(src=())] = val.src[1].const_arg
+  return ret.valid(unwrap(bind.st))
+
 break_sched = PatternMatcher([
+  # VIEW(CONST) becomes VALID (TODO: this should only be done for masked views)
+  (UPat(Ops.VIEW, name="st", src=(UPat.cvar("x"),)), lambda st,x: UOp.const(x.dtype.base, x.const_arg).valid(st.st)),
+  (UPat(Ops.BIND, name="bind", src=(UPat.var("var"), UPat.var("val"))), unbind_variable),
   # bufferized uops either becomes a VIEW(BUFFER) or we VIEW the uop and delete the BUFFER
   (UPat(Ops.VIEW, name="st", src=(UPat(Ops.BUFFER, name="buffer"), UPat.var("x"))), store_or_fuse),
 ])
