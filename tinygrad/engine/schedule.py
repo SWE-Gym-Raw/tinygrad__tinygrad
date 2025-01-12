@@ -289,7 +289,7 @@ def schedule_uop(sink:UOp, store_targets:tuple[UOp, ...], ctx:ScheduleContext) -
     raise RuntimeError(f"Kernel for {si_ctx.metadata} exceeded the {limit} buffer count limit for {device} with {len(si_ctx.bufs)} buffers.")
   # we also allow masked views. if it has a single view and it's equal when you shrink a contig, it's fine
   for ubuf,ops in si_ctx.assign_adj.items():
-    if si_ctx.sinked.get(ubuf) is not None and not all((s:=x.st_arg).contiguous or (len(s.views) == 1 and (m:=s.views[0].mask) is not None \
+    if ubuf.arg < len(si_ctx.sinked) and not all((s:=x.st_arg).contiguous or (len(s.views) == 1 and (m:=s.views[0].mask) is not None \
         and ShapeTracker.from_shape(s.shape).shrink(m) == s.shrink(m)) for x in ops):
       raise RuntimeError("self operand of augmented assign must be contiguous.\nhelp: consider using .contiguous():\n"
                          +colored("   - a += a.T\n", "red")+colored("   + a += a.T.contiguous()", "green"))
