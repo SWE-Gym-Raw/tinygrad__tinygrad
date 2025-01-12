@@ -224,6 +224,7 @@ add_metadata = PatternMatcher([
   (UPat(tuple(Ops), name="x"), lambda ctx,x: None if (m:=ctx.ops_metadata.get(x)) is None else ctx.metadata.add(m)),
   # remove const shape
   (UPat(Ops.CONST, name="root", src=(UPat(),)), lambda root:root.replace(src=())),
+  (UPat(Ops.LOAD, src=(UPat(Ops.LOAD, name="load"), UPat.var("vm"))), lambda load,vm: load.view(vm.st)),
 ])
 add_assign_adjacents = PatternMatcher([(UPat.load(UPat.var("b"), UPat(), name="x"), lambda ctx,b,x: ctx.assign_adj.setdefault(b, []).append(x)
                                if b in ctx.assigns else None)])
@@ -239,12 +240,10 @@ multioutput = PatternMatcher([
   (UPat.load(UPat.var("glbl"), UPat(), name="root"), multi_output_fuse),
 ])
 
-def add_load(ctx:ScheduleItemContext, root:UOp):
-  if root not in ctx.bufs: ctx.bufs.append(root)
-  if root in ctx.assigns: load_op = Ops.PRELOAD
-  else: load_op = Ops.LOAD
-  glbl = UOp(Ops.DEFINE_GLOBAL, root.dtype.ptr(size=root.size), (), ctx.bufs.index(root))
-  return UOp(load_op, root.dtype, (glbl, unwrap(root.st).to_uop()))
+def add_load(ctx:ScheduleItemContext, root:UOp, b:UOp, st:UOp):
+  if b not in ctx.bufs: ctx.bufs.append(b)
+  glbl = UOp(Ops.DEFINE_GLOBAL, root.dtype.ptr(size=root.size), (), ctx.bufs.index(b))
+  return UOp(Ops.LOAD, root.dtype, (glbl, unwrap(root.st).to_uop()))
 
 def add_store(ctx:ScheduleItemContext, root:UOp):
   if all(x.op is Ops.STORE for x in root.src): return None
@@ -255,9 +254,19 @@ def add_store(ctx:ScheduleItemContext, root:UOp):
     new_src.append(UOp.store(glbl, ShapeTracker.from_shape(x.shape).to_uop(), x))
   return root.replace(src=tuple(new_src))
 
+def load_buffer(ctx:ScheduleItemContext, b:UOp):
+  # NOTE: if we're assigning to the BUFFER too, PRELOAD tells toposort to place this load before the ASSIGN
+  if b not in ctx.bufs: ctx.bufs.append(b)
+  glbl = UOp(Ops.DEFINE_GLOBAL, b.dtype.ptr(size=b.size), (), ctx.bufs.index(b))
+  return UOp(Ops.PRELOAD if b in ctx.assigns else Ops.LOAD, b.dtype.base, (glbl, unwrap(b.st).to_uop()))
+
 remove_buffers = PatternMatcher([
-  (UPat(Ops.BUFFER, name="root"), add_load),
+  (UPat(Ops.LOAD, name="root", src=(UPat(Ops.BUFFER, name="b"), UPat.var("st"))), add_load),
   (UPat(Ops.SINK, name="root"), add_store),
+])
+
+load_realized_bufs = PatternMatcher([
+  (UPat(Ops.BUFFER, name="b"), load_buffer),
 ])
 
 def schedule_uop(sink:UOp, store_targets:tuple[UOp, ...], ctx:ScheduleContext) -> ScheduleItem:
@@ -265,6 +274,7 @@ def schedule_uop(sink:UOp, store_targets:tuple[UOp, ...], ctx:ScheduleContext) -
   si_ctx = ScheduleItemContext(ctx.ops_metadata, ctx.assigns, ctx.var_vals, {}, bufs=list(store_targets))
   # start by replacing BUFFER in the graph with LOAD/STORE
   sink = graph_rewrite(sink, remove_buffers, si_ctx)
+  sink = graph_rewrite(sink, load_realized_bufs, si_ctx)
   # do ast rewrite
   create_ctx = add_metadata if len(si_ctx.assigns) == 0 else add_metadata+add_assign_adjacents
   sink = graph_rewrite(sink, create_ctx, si_ctx)
@@ -496,12 +506,12 @@ do_realize = PatternMatcher([
 
 # **** break the graph into kernels, collapse BUFFERs that are not needed anymore
 
-def store_or_fuse(ctx:ScheduleContext, x:UOp, buffer:UOp, st:UOp):
-  if (m:=ctx.tensor_uops[buffer][0].metadata) is not None: ctx.ops_metadata[x] = m
-  if buffer not in ctx.realizes: return x.view(unwrap(st.st)) # collapse BUFFER
-  # otherwise all children use a VIEW(BUFFER) instead of the underlying UOp
-  ctx.realizes[buffer] = x
-  return buffer.view(unwrap(st.st))
+def store_or_fuse(ctx:ScheduleContext, x:UOp, b:UOp, st:UOp):
+  if (m:=ctx.tensor_uops[b][0].metadata) is not None: ctx.ops_metadata[x] = m
+  if b not in ctx.realizes: return x.view(unwrap(st.st)) # collapse BUFFER
+  # otherwise _all_ children LOAD the buffer
+  ctx.realizes[b] = x
+  return UOp(Ops.LOAD, x.dtype, (b, unwrap(st.st).to_uop()))
 
 def unbind_variable(ctx:ScheduleContext, bind:UOp, var:UOp, val:UOp):
   assert isinstance(val.src[1].const_arg, int), f"expected BIND value to be int {val}"
@@ -513,7 +523,7 @@ break_sched = PatternMatcher([
   (UPat(Ops.CONST, name="x", src=(UPat(Ops.VIEW, name="st"),)), lambda x,st: UOp.const(x.dtype.base, x.const_arg).valid(st.st)),
   (UPat(Ops.BIND, name="bind", src=(UPat.var("var"), UPat.var("val"))), unbind_variable),
   # bufferized uops either becomes a VIEW(BUFFER) or we VIEW the uop and delete the BUFFER
-  (UPat(Ops.VIEW, name="st", src=(UPat(Ops.BUFFER, name="buffer"), UPat.var("x"))), store_or_fuse),
+  (UPat(Ops.VIEW, name="st", src=(UPat(Ops.BUFFER, name="b"), UPat.var("x"))), store_or_fuse),
 ])
 
 # **** Schedule context builder
