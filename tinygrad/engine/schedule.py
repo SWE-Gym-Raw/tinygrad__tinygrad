@@ -223,18 +223,28 @@ to_si = PatternMatcher([
 add_metadata = PatternMatcher([
   (UPat(tuple(Ops), name="x"), lambda ctx,x: None if (m:=ctx.ops_metadata.get(x)) is None else ctx.metadata.add(m)),
   # remove const shape
-  (UPat(Ops.CONST, name="root", src=(UPat(),)), lambda root:root.replace(src=()))
+  (UPat(Ops.CONST, name="root", src=(UPat(),)), lambda root:root.replace(src=())),
 ])
 add_assign_adjacents = PatternMatcher([(UPat.load(UPat.var("b"), UPat(), name="x"), lambda ctx,b,x: ctx.assign_adj.setdefault(b, []).append(x)
                                if b in ctx.assigns else None)])
 
-# late folding for multi output kernels
-multioutput = PatternMatcher([(UPat.load(UPat.var("glbl"), UPat()), lambda ctx,glbl: list(ctx.sinked.values())[glbl.arg]),])
+def multi_output_fuse(ctx:UOp, glbl:UOp, root:UOp):
+  if glbl.arg >= len(ctx.sinked): return
+  store_vals = list(ctx.sinked.values())
+  ret = store_vals[glbl.arg]
+  return ret
 
-def add_load(ctx:list[UOp], root:UOp):
-  if root not in ctx: ctx.append(root)
-  glbl = UOp(Ops.DEFINE_GLOBAL, root.dtype.ptr(size=root.size), (), ctx.index(root))
-  return UOp(Ops.LOAD, root.dtype, (glbl, unwrap(root.st).to_uop()))
+# late folding for multi output kernels
+multioutput = PatternMatcher([
+  (UPat.load(UPat.var("glbl"), UPat(), name="root"), multi_output_fuse),
+])
+
+def add_load(ctx:ScheduleItemContext, root:UOp):
+  if root not in ctx.bufs: ctx.bufs.append(root)
+  if root in ctx.assigns: load_op = Ops.PRELOAD
+  else: load_op = Ops.LOAD
+  glbl = UOp(Ops.DEFINE_GLOBAL, root.dtype.ptr(size=root.size), (), ctx.bufs.index(root))
+  return UOp(load_op, root.dtype, (glbl, unwrap(root.st).to_uop()))
 
 def add_store(ctx:list[UOp], root:UOp):
   if all(x.op is Ops.STORE for x in root.src): return None
@@ -251,12 +261,14 @@ remove_buffers = PatternMatcher([
 
 def schedule_uop(sink:UOp, store_targets:tuple[UOp, ...], ctx:ScheduleContext) -> ScheduleItem:
   assert all(x.op is Ops.BUFFER for x in store_targets), f"targets must be BUFFER"
+  si_ctx = ScheduleItemContext(ctx.ops_metadata, ctx.assigns, ctx.var_vals, {}, bufs=list(store_targets))
   # start by replacing BUFFER in the graph with LOAD/STORE
-  sink = graph_rewrite(sink, remove_buffers, bufs:=list(store_targets))
+  sink = graph_rewrite(sink, remove_buffers, si_ctx)
+  si_ctx.sinked.update((b,x.src[2]) for b,x in zip(store_targets, sink.src))
   # do ast rewrite
-  si_ctx = ScheduleItemContext(ctx.ops_metadata, ctx.assigns, ctx.var_vals, {b:x.src[2] for b,x in zip(bufs, sink.src)}, bufs=bufs)
   create_ctx = add_metadata if len(si_ctx.assigns) == 0 else add_metadata+add_assign_adjacents
-  sink = graph_rewrite(sink, create_ctx if len(si_ctx.sinked) == 1 else multioutput+create_ctx, si_ctx)
+  sink = graph_rewrite(sink, create_ctx, si_ctx)
+  if len(si_ctx.sinked) > 1: sink = graph_rewrite(sink, multioutput, si_ctx)
   # do movement ops
   sink = graph_rewrite(graph_rewrite(sink, view_left), view_right)
   # convert to AST
@@ -272,7 +284,7 @@ def schedule_uop(sink:UOp, store_targets:tuple[UOp, ...], ctx:ScheduleContext) -
       raise RuntimeError("self operand of augmented assign must be contiguous.\nhelp: consider using .contiguous():\n"
                          +colored("   - a += a.T\n", "red")+colored("   + a += a.T.contiguous()", "green"))
   return ScheduleItem(sink, tuple(u.buffer for u in si_ctx.bufs if u.size != 0), tuple(si_ctx.metadata),
-                      tuple(ubuf for ubuf,ops in si_ctx.assign_adj.items() if any(x.op is Ops.PRELOAD for x in ops)))
+                      tuple(si_ctx.bufs[glbl.arg] for glbl,ops in si_ctx.assign_adj.items() if any(x.op is Ops.PRELOAD for x in ops)))
 
 PROCESS_REPLAY_CAPTURE: dict[str, bytes] = {}
 if CAPTURE_PROCESS_REPLAY:
